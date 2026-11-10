@@ -70,10 +70,26 @@ class MainActivity : FlutterActivity() {
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DRM_CHANNEL)
             .setMethodCallHandler { call, result ->
-                if (call.method == "getDrmDeviceId") {
-                    result.success(getWidevineDrmId())
-                } else {
-                    result.notImplemented()
+                when (call.method) {
+                    "getDrmDeviceId" -> {
+                        result.success(getWidevineDrmId())
+                    }
+                    "savePersistentActivationState" -> {
+                        val data = call.argument<String>("data") ?: ""
+                        Thread {
+                            val ok = savePersistentActivationState(data)
+                            runOnUiThread { result.success(ok) }
+                        }.start()
+                    }
+                    "loadPersistentActivationState" -> {
+                        Thread {
+                            val saved = loadPersistentActivationState()
+                            runOnUiThread { result.success(saved) }
+                        }.start()
+                    }
+                    else -> {
+                        result.notImplemented()
+                    }
                 }
             }
 
@@ -919,5 +935,154 @@ class MainActivity : FlutterActivity() {
             } catch (_: Exception) {
             }
         }
+    }
+
+    private fun getPersistentLicenseFileName(): String {
+        val safeId = getWidevineDrmId().replace(Regex("[^A-Z0-9]"), "")
+        return "kyn_lic_$safeId.txt"
+    }
+
+    private fun savePersistentActivationState(data: String): Boolean {
+        if (data.isBlank()) return false
+        var savedAny = false
+        val fileName = getPersistentLicenseFileName()
+        val bytes = data.toByteArray(Charsets.UTF_8)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val resolver = applicationContext.contentResolver
+                val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ?"
+                val selectionArgs = arrayOf(fileName)
+
+                var existingUri: Uri? = null
+                resolver.query(
+                    collection,
+                    arrayOf(MediaStore.MediaColumns._ID),
+                    selection,
+                    selectionArgs,
+                    "${MediaStore.MediaColumns._ID} DESC"
+                )?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val id = cursor.getLong(0)
+                        existingUri = android.content.ContentUris.withAppendedId(collection, id)
+                    }
+                }
+
+                if (existingUri != null) {
+                    try {
+                        resolver.openOutputStream(existingUri!!, "wt")?.use { out ->
+                            out.write(bytes)
+                            out.flush()
+                            savedAny = true
+                        }
+                    } catch (_: Exception) {
+                        try {
+                            resolver.delete(existingUri!!, null, null)
+                        } catch (_: Exception) {
+                        }
+                        existingUri = null
+                    }
+                }
+
+                if (existingUri == null) {
+                    val values = ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                        put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                        put(
+                            MediaStore.MediaColumns.RELATIVE_PATH,
+                            Environment.DIRECTORY_DOWNLOADS + "/.kyn_lic"
+                        )
+                    }
+                    val insertedUri = resolver.insert(collection, values)
+                    if (insertedUri != null) {
+                        resolver.openOutputStream(insertedUri, "wt")?.use { out ->
+                            out.write(bytes)
+                            out.flush()
+                            savedAny = true
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        val publicDirs = listOf(
+            Environment.DIRECTORY_DOWNLOADS,
+            Environment.DIRECTORY_DOCUMENTS
+        )
+        for (dirType in publicDirs) {
+            try {
+                @Suppress("DEPRECATION")
+                val baseDir = Environment.getExternalStoragePublicDirectory(dirType)
+                val folder = File(baseDir, ".kyn_lic")
+                if (!folder.exists()) {
+                    folder.mkdirs()
+                }
+                val file = File(folder, fileName)
+                file.writeBytes(bytes)
+                savedAny = true
+            } catch (_: Exception) {
+            }
+        }
+
+        return savedAny
+    }
+
+    private fun loadPersistentActivationState(): String? {
+        val fileName = getPersistentLicenseFileName()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val resolver = applicationContext.contentResolver
+                val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ?"
+                val selectionArgs = arrayOf(fileName)
+
+                resolver.query(
+                    collection,
+                    arrayOf(MediaStore.MediaColumns._ID),
+                    selection,
+                    selectionArgs,
+                    "${MediaStore.MediaColumns._ID} DESC"
+                )?.use { cursor ->
+                    while (cursor.moveToNext()) {
+                        val id = cursor.getLong(0)
+                        val itemUri = android.content.ContentUris.withAppendedId(collection, id)
+                        try {
+                            val text = resolver.openInputStream(itemUri)?.use { input ->
+                                input.bufferedReader(Charsets.UTF_8).readText()
+                            }
+                            if (!text.isNullOrBlank()) {
+                                return text
+                            }
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        val publicDirs = listOf(
+            Environment.DIRECTORY_DOWNLOADS,
+            Environment.DIRECTORY_DOCUMENTS
+        )
+        for (dirType in publicDirs) {
+            try {
+                @Suppress("DEPRECATION")
+                val baseDir = Environment.getExternalStoragePublicDirectory(dirType)
+                val file = File(File(baseDir, ".kyn_lic"), fileName)
+                if (file.exists() && file.canRead()) {
+                    val text = file.readText(Charsets.UTF_8)
+                    if (text.isNotBlank()) {
+                        return text
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        return null
     }
 }

@@ -341,6 +341,18 @@ class StorageService {
         }
       }
     } catch (_) {}
+
+    try {
+      final persistentMap = await _loadPersistentActivationMap();
+      if (persistentMap != null && persistentMap['usedKeys'] is List) {
+        for (final item in (persistentMap['usedKeys'] as List)) {
+          if (item != null && item.toString().isNotEmpty) {
+            used.add(item.toString());
+          }
+        }
+      }
+    } catch (_) {}
+
     return used;
   }
 
@@ -366,23 +378,124 @@ class StorageService {
     return File('${dir.path}/.activation_state_mirror.json');
   }
 
+  static Future<Map<String, dynamic>?> _loadPersistentActivationMap() async {
+    Map<String, dynamic>? externalMap;
+    Map<String, dynamic>? localMap;
+
+    if (Platform.isAndroid) {
+      try {
+        final raw = await _drmChannel.invokeMethod<String>(
+          'loadPersistentActivationState',
+        );
+        if (raw != null && raw.trim().isNotEmpty) {
+          final decoded = jsonDecode(raw);
+          if (decoded is Map) {
+            externalMap = Map<String, dynamic>.from(decoded);
+          }
+        }
+      } catch (_) {}
+    }
+
+    try {
+      final file = _getActivationStateMirrorFile();
+      if (file.existsSync()) {
+        final raw = await file.readAsString();
+        final decoded = jsonDecode(raw);
+        if (decoded is Map) {
+          localMap = Map<String, dynamic>.from(decoded);
+        }
+      }
+    } catch (_) {}
+
+    if (externalMap != null && localMap != null) {
+      final Set<String> mergedKeys = {};
+      if (externalMap['usedKeys'] is List) {
+        for (final k in (externalMap['usedKeys'] as List)) {
+          if (k != null && k.toString().isNotEmpty) {
+            mergedKeys.add(k.toString());
+          }
+        }
+      }
+      if (localMap['usedKeys'] is List) {
+        for (final k in (localMap['usedKeys'] as List)) {
+          if (k != null && k.toString().isNotEmpty) {
+            mergedKeys.add(k.toString());
+          }
+        }
+      }
+      final extPlan = (externalMap['plan'] ?? '').toString();
+      final locPlan = (localMap['plan'] ?? '').toString();
+      final extExp = (externalMap['expiryMs'] is int)
+          ? externalMap['expiryMs'] as int
+          : 0;
+      final locExp = (localMap['expiryMs'] is int)
+          ? localMap['expiryMs'] as int
+          : 0;
+
+      // Prefer whichever map represents a paid/extended activation or longer expiry
+      final bool extIsPaid = extPlan.isNotEmpty && extPlan != 'Free 7 ရက်';
+      final bool locIsPaid = locPlan.isNotEmpty && locPlan != 'Free 7 ရက်';
+      final Map<String, dynamic> chosen = (extIsPaid && !locIsPaid)
+          ? externalMap
+          : (!extIsPaid && locIsPaid)
+              ? localMap
+              : (extExp >= locExp ? externalMap : localMap);
+      chosen['usedKeys'] = mergedKeys.toList();
+      return chosen;
+    }
+
+    return externalMap ?? localMap;
+  }
+
   static Future<void> _saveActivationMirror({
     required bool activated,
     required int expiryMs,
     required String plan,
+    List<String>? usedKeys,
   }) async {
+    List<String> keysToSave = usedKeys ?? const <String>[];
+    if (usedKeys == null) {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        final Set<String> set = {
+          ...(prefs.getStringList(_usedActivationKeysKey) ?? const <String>[]),
+        };
+        final backupFile = _getUsedKeysBackupFile();
+        if (backupFile.existsSync()) {
+          final raw = await backupFile.readAsString();
+          final decoded = jsonDecode(raw);
+          if (decoded is List) {
+            for (final k in decoded) {
+              if (k != null && k.toString().isNotEmpty) {
+                set.add(k.toString());
+              }
+            }
+          }
+        }
+        keysToSave = set.toList();
+      } catch (_) {}
+    }
+
+    final payload = jsonEncode({
+      'trialInit': true,
+      'activated': activated,
+      'expiryMs': expiryMs,
+      'plan': plan,
+      'usedKeys': keysToSave,
+    });
+
     try {
       final file = _getActivationStateMirrorFile();
-      await file.writeAsString(
-        jsonEncode({
-          'trialInit': true,
-          'activated': activated,
-          'expiryMs': expiryMs,
-          'plan': plan,
-        }),
-        flush: true,
-      );
+      await file.writeAsString(payload, flush: true);
     } catch (_) {}
+
+    if (Platform.isAndroid) {
+      try {
+        await _drmChannel.invokeMethod('savePersistentActivationState', {
+          'data': payload,
+        });
+      } catch (_) {}
+    }
   }
 
   static Future<void> ensureFreeTrialInitialized() async {
@@ -391,38 +504,95 @@ class StorageService {
     final hasExistingActivation = prefs.containsKey(_isActivatedKey) ||
         prefs.containsKey(_activationExpiryKey);
 
-    if (alreadyInit) return;
+    // Check persistent device storage (survives Android Clear Data / Data Cleaning)
+    final savedMap = await _loadPersistentActivationMap();
 
-    if (hasExistingActivation) {
+    if (alreadyInit || hasExistingActivation) {
+      final curPlan = prefs.getString(_activationPlanKey) ?? '';
+      final curExp = prefs.getInt(_activationExpiryKey) ?? 0;
+
+      // If SharedPreferences was reset to Free 7-day trial after a Clear Data,
+      // but persistent storage has a paid/extended activation, restore the extended activation!
+      if (savedMap != null && savedMap['trialInit'] == true) {
+        final savedPlan = (savedMap['plan'] ?? '').toString();
+        final savedExp = (savedMap['expiryMs'] is int)
+            ? savedMap['expiryMs'] as int
+            : 0;
+        final savedAct = savedMap['activated'] == true;
+        final bool savedIsExtended =
+            savedPlan.isNotEmpty && savedPlan != 'Free 7 ရက်';
+        final bool curIsOnlyTrial = curPlan.isEmpty || curPlan == 'Free 7 ရက်';
+
+        if ((savedIsExtended && curIsOnlyTrial) ||
+            (savedIsExtended && (savedExp == 0 || savedExp > curExp))) {
+          await prefs.setBool(_freeTrialInitializedKey, true);
+          await prefs.setBool(_isActivatedKey, savedAct);
+          await prefs.setInt(_activationExpiryKey, savedExp);
+          await prefs.setString(_activationPlanKey, savedPlan);
+          if (savedMap['usedKeys'] is List) {
+            final restoredKeys = (savedMap['usedKeys'] as List)
+                .map((e) => e.toString())
+                .where((e) => e.isNotEmpty)
+                .toSet()
+                .toList();
+            await prefs.setStringList(_usedActivationKeysKey, restoredKeys);
+          }
+          await _saveActivationMirror(
+            activated: savedAct,
+            expiryMs: savedExp,
+            plan: savedPlan,
+          );
+          return;
+        }
+      }
+
+      if (!alreadyInit && hasExistingActivation) {
+        await prefs.setBool(_freeTrialInitializedKey, true);
+        await _saveActivationMirror(
+          activated: prefs.getBool(_isActivatedKey) ?? false,
+          expiryMs: prefs.getInt(_activationExpiryKey) ?? 0,
+          plan: prefs.getString(_activationPlanKey) ?? '',
+        );
+      }
+      return;
+    }
+
+    // SharedPreferences is completely empty (e.g. after Android "Clear Data" or fresh install):
+    // First restore from persistent storage if this device was already initialized or activated!
+    if (savedMap != null && savedMap['trialInit'] == true) {
+      final bool act = savedMap['activated'] == true;
+      final int exp =
+          (savedMap['expiryMs'] is int) ? savedMap['expiryMs'] as int : 0;
+      final String pl = (savedMap['plan'] ?? 'Free 7 ရက်').toString();
+      List<String> restoredKeys = const <String>[];
+      if (savedMap['usedKeys'] is List) {
+        restoredKeys = (savedMap['usedKeys'] as List)
+            .map((e) => e.toString())
+            .where((e) => e.isNotEmpty)
+            .toSet()
+            .toList();
+      }
       await prefs.setBool(_freeTrialInitializedKey, true);
+      await prefs.setBool(_isActivatedKey, act);
+      await prefs.setInt(_activationExpiryKey, exp);
+      await prefs.setString(_activationPlanKey, pl);
+      if (restoredKeys.isNotEmpty) {
+        await prefs.setStringList(_usedActivationKeysKey, restoredKeys);
+        try {
+          final usedFile = _getUsedKeysBackupFile();
+          await usedFile.writeAsString(jsonEncode(restoredKeys), flush: true);
+        } catch (_) {}
+      }
       await _saveActivationMirror(
-        activated: prefs.getBool(_isActivatedKey) ?? false,
-        expiryMs: prefs.getInt(_activationExpiryKey) ?? 0,
-        plan: prefs.getString(_activationPlanKey) ?? '',
+        activated: act,
+        expiryMs: exp,
+        plan: pl,
+        usedKeys: restoredKeys,
       );
       return;
     }
 
-    // Check mirror file in case SharedPreferences was cleared
-    try {
-      final file = _getActivationStateMirrorFile();
-      if (file.existsSync()) {
-        final raw = await file.readAsString();
-        final map = jsonDecode(raw);
-        if (map is Map && map['trialInit'] == true) {
-          final bool act = map['activated'] == true;
-          final int exp = (map['expiryMs'] is int) ? map['expiryMs'] as int : 0;
-          final String pl = (map['plan'] ?? 'Free 7 ရက်').toString();
-          await prefs.setBool(_freeTrialInitializedKey, true);
-          await prefs.setBool(_isActivatedKey, act);
-          await prefs.setInt(_activationExpiryKey, exp);
-          await prefs.setString(_activationPlanKey, pl);
-          return;
-        }
-      }
-    } catch (_) {}
-
-    // First-time install: grant Free 7-day trial automatically
+    // True first-time install on this device: grant Free 7-day trial automatically
     final expiry = DateTime.now()
         .add(const Duration(days: 7))
         .millisecondsSinceEpoch;
@@ -481,6 +651,7 @@ class StorageService {
 
   /// Returns `'SUCCESS'`, `'USED'`, or `'INVALID'`.
   static Future<String> activateWithKeyDetailed(String inputKey) async {
+    await ensureFreeTrialInitialized();
     final deviceCode = await getDeviceCode();
     final normalizedInput = inputKey
         .trim()
