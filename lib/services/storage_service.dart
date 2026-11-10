@@ -21,6 +21,10 @@ class StorageService {
       'kyn_store_free_trial_init_v1';
   static const String _usedActivationKeysKey =
       'kyn_store_used_activation_keys_v1';
+  static const String _activationLastSeenMsKey =
+      'kyn_store_activation_last_seen_ms_v1';
+  static const String _activationLastWallMsKey =
+      'kyn_store_activation_last_wall_ms_v1';
   static const MethodChannel _drmChannel = MethodChannel(
     'com.kynstore.loan_calculator/device_drm',
   );
@@ -440,6 +444,13 @@ class StorageService {
           : (!extIsPaid && locIsPaid)
               ? localMap
               : (extExp >= locExp ? externalMap : localMap);
+      final int extSeen = (externalMap['lastSeenMs'] is int)
+          ? externalMap['lastSeenMs'] as int
+          : 0;
+      final int locSeen = (localMap['lastSeenMs'] is int)
+          ? localMap['lastSeenMs'] as int
+          : 0;
+      chosen['lastSeenMs'] = extSeen >= locSeen ? extSeen : locSeen;
       chosen['usedKeys'] = mergedKeys.toList();
       return chosen;
     }
@@ -447,16 +458,64 @@ class StorageService {
     return externalMap ?? localMap;
   }
 
+  static Future<int> _getEffectiveNowMs(SharedPreferences prefs) async {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    var lastSeenMs = prefs.getInt(_activationLastSeenMsKey) ?? 0;
+    var lastWallMs = prefs.getInt(_activationLastWallMsKey) ?? 0;
+    final expiryMs = prefs.getInt(_activationExpiryKey) ?? 0;
+    final plan = prefs.getString(_activationPlanKey) ?? '';
+
+    // Ensure Free 7-day trial can never show > 7 days remaining even if clock is rolled back
+    if (plan == 'Free 7 ရက်' && expiryMs > 0) {
+      final trialStartMs = expiryMs - const Duration(days: 7).inMilliseconds;
+      if (lastSeenMs < trialStartMs) {
+        lastSeenMs = trialStartMs;
+      }
+    }
+
+    if (lastWallMs > 0 && nowMs > lastWallMs) {
+      final delta = nowMs - lastWallMs;
+      if (nowMs >= lastSeenMs) {
+        lastSeenMs = nowMs;
+      } else {
+        // Clock was previously rolled back and is now ticking forward; advance monotonic clock
+        lastSeenMs += delta;
+      }
+    } else if (nowMs > lastSeenMs) {
+      lastSeenMs = nowMs;
+    }
+
+    if (lastSeenMs <= 0) {
+      lastSeenMs = nowMs;
+    }
+
+    await prefs.setInt(_activationLastSeenMsKey, lastSeenMs);
+    await prefs.setInt(_activationLastWallMsKey, nowMs);
+    return lastSeenMs;
+  }
+
   static Future<void> _saveActivationMirror({
     required bool activated,
     required int expiryMs,
     required String plan,
     List<String>? usedKeys,
+    int? lastSeenMs,
+    int? lastWallMs,
   }) async {
     List<String> keysToSave = usedKeys ?? const <String>[];
-    if (usedKeys == null) {
-      try {
-        final prefs = await SharedPreferences.getInstance();
+    int resolvedLastSeen = lastSeenMs ?? 0;
+    int resolvedLastWall = lastWallMs ?? DateTime.now().millisecondsSinceEpoch;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (resolvedLastSeen <= 0) {
+        resolvedLastSeen = prefs.getInt(_activationLastSeenMsKey) ??
+            DateTime.now().millisecondsSinceEpoch;
+      }
+      if (lastWallMs == null) {
+        resolvedLastWall = prefs.getInt(_activationLastWallMsKey) ??
+            DateTime.now().millisecondsSinceEpoch;
+      }
+      if (usedKeys == null) {
         final Set<String> set = {
           ...(prefs.getStringList(_usedActivationKeysKey) ?? const <String>[]),
         };
@@ -473,8 +532,8 @@ class StorageService {
           }
         }
         keysToSave = set.toList();
-      } catch (_) {}
-    }
+      }
+    } catch (_) {}
 
     final payload = jsonEncode({
       'trialInit': true,
@@ -482,6 +541,8 @@ class StorageService {
       'expiryMs': expiryMs,
       'plan': plan,
       'usedKeys': keysToSave,
+      'lastSeenMs': resolvedLastSeen,
+      'lastWallMs': resolvedLastWall,
     });
 
     try {
@@ -511,14 +572,20 @@ class StorageService {
       final curPlan = prefs.getString(_activationPlanKey) ?? '';
       final curExp = prefs.getInt(_activationExpiryKey) ?? 0;
 
-      // If SharedPreferences was reset to Free 7-day trial after a Clear Data,
-      // but persistent storage has a paid/extended activation, restore the extended activation!
       if (savedMap != null && savedMap['trialInit'] == true) {
         final savedPlan = (savedMap['plan'] ?? '').toString();
         final savedExp = (savedMap['expiryMs'] is int)
             ? savedMap['expiryMs'] as int
             : 0;
         final savedAct = savedMap['activated'] == true;
+        final savedSeen = (savedMap['lastSeenMs'] is int)
+            ? savedMap['lastSeenMs'] as int
+            : 0;
+        final curSeen = prefs.getInt(_activationLastSeenMsKey) ?? 0;
+        if (savedSeen > curSeen) {
+          await prefs.setInt(_activationLastSeenMsKey, savedSeen);
+        }
+
         final bool savedIsExtended =
             savedPlan.isNotEmpty && savedPlan != 'Free 7 ရက်';
         final bool curIsOnlyTrial = curPlan.isEmpty || curPlan == 'Free 7 ရက်';
@@ -537,6 +604,7 @@ class StorageService {
                 .toList();
             await prefs.setStringList(_usedActivationKeysKey, restoredKeys);
           }
+          await _getEffectiveNowMs(prefs);
           await _saveActivationMirror(
             activated: savedAct,
             expiryMs: savedExp,
@@ -546,6 +614,7 @@ class StorageService {
         }
       }
 
+      await _getEffectiveNowMs(prefs);
       if (!alreadyInit && hasExistingActivation) {
         await prefs.setBool(_freeTrialInitializedKey, true);
         await _saveActivationMirror(
@@ -564,6 +633,12 @@ class StorageService {
       final int exp =
           (savedMap['expiryMs'] is int) ? savedMap['expiryMs'] as int : 0;
       final String pl = (savedMap['plan'] ?? 'Free 7 ရက်').toString();
+      final int savedSeen = (savedMap['lastSeenMs'] is int)
+          ? savedMap['lastSeenMs'] as int
+          : 0;
+      final int savedWall = (savedMap['lastWallMs'] is int)
+          ? savedMap['lastWallMs'] as int
+          : 0;
       List<String> restoredKeys = const <String>[];
       if (savedMap['usedKeys'] is List) {
         restoredKeys = (savedMap['usedKeys'] as List)
@@ -576,6 +651,12 @@ class StorageService {
       await prefs.setBool(_isActivatedKey, act);
       await prefs.setInt(_activationExpiryKey, exp);
       await prefs.setString(_activationPlanKey, pl);
+      if (savedSeen > 0) {
+        await prefs.setInt(_activationLastSeenMsKey, savedSeen);
+      }
+      if (savedWall > 0) {
+        await prefs.setInt(_activationLastWallMsKey, savedWall);
+      }
       if (restoredKeys.isNotEmpty) {
         await prefs.setStringList(_usedActivationKeysKey, restoredKeys);
         try {
@@ -583,6 +664,7 @@ class StorageService {
           await usedFile.writeAsString(jsonEncode(restoredKeys), flush: true);
         } catch (_) {}
       }
+      await _getEffectiveNowMs(prefs);
       await _saveActivationMirror(
         activated: act,
         expiryMs: exp,
@@ -593,7 +675,8 @@ class StorageService {
     }
 
     // True first-time install on this device: grant Free 7-day trial automatically
-    final expiry = DateTime.now()
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final expiry = DateTime.fromMillisecondsSinceEpoch(nowMs)
         .add(const Duration(days: 7))
         .millisecondsSinceEpoch;
     const planLabel = 'Free 7 ရက်';
@@ -601,10 +684,14 @@ class StorageService {
     await prefs.setBool(_isActivatedKey, true);
     await prefs.setInt(_activationExpiryKey, expiry);
     await prefs.setString(_activationPlanKey, planLabel);
+    await prefs.setInt(_activationLastSeenMsKey, nowMs);
+    await prefs.setInt(_activationLastWallMsKey, nowMs);
     await _saveActivationMirror(
       activated: true,
       expiryMs: expiry,
       plan: planLabel,
+      lastSeenMs: nowMs,
+      lastWallMs: nowMs,
     );
   }
 
@@ -614,13 +701,15 @@ class StorageService {
     final activated = prefs.getBool(_isActivatedKey) ?? false;
     if (!activated) return false;
 
+    final effectiveNowMs = await _getEffectiveNowMs(prefs);
     final expiryMs = prefs.getInt(_activationExpiryKey) ?? 0;
-    if (expiryMs > 0 && DateTime.now().millisecondsSinceEpoch > expiryMs) {
+    if (expiryMs > 0 && effectiveNowMs > expiryMs) {
       await prefs.setBool(_isActivatedKey, false);
       await _saveActivationMirror(
         activated: false,
         expiryMs: expiryMs,
         plan: prefs.getString(_activationPlanKey) ?? 'Free 7 ရက်',
+        lastSeenMs: effectiveNowMs,
       );
       return false;
     }
@@ -630,11 +719,12 @@ class StorageService {
   static Future<String> getActivationStatusText() async {
     final prefs = await SharedPreferences.getInstance();
     final activated = await isActivated();
+    final effectiveNowMs = await _getEffectiveNowMs(prefs);
     final expiryMs = prefs.getInt(_activationExpiryKey) ?? 0;
     final plan = prefs.getString(_activationPlanKey) ?? '';
 
     if (!activated) {
-      if (expiryMs > 0 && DateTime.now().millisecondsSinceEpoch > expiryMs) {
+      if (expiryMs > 0 && effectiveNowMs > expiryMs) {
         return 'သက်တမ်းကုန်ဆုံးသွားပါပြီ ($plan)';
       }
       return 'Not Activated';
@@ -644,7 +734,7 @@ class StorageService {
       return 'Activated (Life Time)';
     }
 
-    final diffMs = expiryMs - DateTime.now().millisecondsSinceEpoch;
+    final diffMs = expiryMs - effectiveNowMs;
     final remainingDays = (diffMs / (1000 * 60 * 60 * 24)).ceil();
     return 'Activated ($plan - $remainingDays ရက် ကျန်)';
   }
@@ -708,6 +798,8 @@ class StorageService {
         await _markActivationKeyAsUsed(normalizedInput);
 
         final prefs = await SharedPreferences.getInstance();
+        final nowMs = DateTime.now().millisecondsSinceEpoch;
+        final effectiveNowMs = await _getEffectiveNowMs(prefs);
         await prefs.setBool(_freeTrialInitializedKey, true);
         await prefs.setBool(_isActivatedKey, true);
         await prefs.setString(_activationPlanKey, label);
@@ -715,19 +807,23 @@ class StorageService {
         if (days <= 0) {
           await prefs.setInt(_activationExpiryKey, 0);
         } else {
-          final nowMs = DateTime.now().millisecondsSinceEpoch;
           final currentExpiryMs = prefs.getInt(_activationExpiryKey) ?? 0;
-          final baseMs =
-              (currentExpiryMs > nowMs) ? currentExpiryMs : nowMs;
+          final baseMs = (currentExpiryMs > effectiveNowMs)
+              ? currentExpiryMs
+              : effectiveNowMs;
           savedExpiry = DateTime.fromMillisecondsSinceEpoch(baseMs)
               .add(Duration(days: days))
               .millisecondsSinceEpoch;
           await prefs.setInt(_activationExpiryKey, savedExpiry);
         }
+        await prefs.setInt(_activationLastSeenMsKey, effectiveNowMs);
+        await prefs.setInt(_activationLastWallMsKey, nowMs);
         await _saveActivationMirror(
           activated: true,
           expiryMs: savedExpiry,
           plan: label,
+          lastSeenMs: effectiveNowMs,
+          lastWallMs: nowMs,
         );
         return 'SUCCESS';
       }
